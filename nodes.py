@@ -436,7 +436,7 @@ class RenderNLFPoses:
             for pose in pose_input:
                 if pose.shape[0] == 0:
                     continue
-                candidate = pose[0].cpu().numpy()
+                candidate = pose[0].cpu().numpy() if isinstance(pose[0], torch.Tensor) else np.asarray(pose[0])
                 if np.any(candidate):
                     pose_3d_first_driving_frame = candidate
                     break

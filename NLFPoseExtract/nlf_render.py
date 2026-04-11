@@ -15,8 +15,8 @@ def p3d_single_p2d(points, intrinsic_matrix):
     X, Y, Z = points[0], points[1], points[2]
     u = (intrinsic_matrix[0, 0] * X / Z) + intrinsic_matrix[0, 2]
     v = (intrinsic_matrix[1, 1] * Y / Z) + intrinsic_matrix[1, 2]
-    u_np = u.cpu().numpy()
-    v_np = v.cpu().numpy()
+    u_np = u.cpu().numpy() if hasattr(u, 'cpu') else float(u)
+    v_np = v.cpu().numpy() if hasattr(v, 'cpu') else float(v)
     return np.array([u_np, v_np])
 
 def process_data_to_COCO_format(joints):
@@ -335,7 +335,9 @@ def align_persons_across_frames(smpl_poses, max_persons=2):
                 if j in assigned:
                     continue
                 curr_pelvis = curr_pose[0]
-                dist = np.linalg.norm(prev_pelvis.cpu().numpy() - curr_pelvis.cpu().numpy())
+                prev_np = prev_pelvis.cpu().numpy() if hasattr(prev_pelvis, 'cpu') else np.asarray(prev_pelvis)
+                curr_np = curr_pelvis.cpu().numpy() if hasattr(curr_pelvis, 'cpu') else np.asarray(curr_pelvis)
+                dist = np.linalg.norm(prev_np - curr_np)
                 if dist < min_dist:
                     min_dist = dist
                     min_j = j
