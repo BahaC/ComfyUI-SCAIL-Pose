@@ -384,6 +384,8 @@ class RenderNLFPoses:
                 "scale_hands": ("BOOLEAN", {"default": True, "tooltip": "Whether to scale hand keypoints when aligning DW poses"}),
                 "render_backend": (["taichi", "torch"], {"default": "taichi", "tooltip": "Rendering backend to use"}),
                 "single_person": ("BOOLEAN", {"default": False, "tooltip": "When True, select the main character from NLF (largest 3D body in first frame) and filter both NLF and DWPose to that one person."}),
+                "fit_in_canvas": ("BOOLEAN", {"default": True, "tooltip": "Auto-scale the projected pose to fit inside the canvas. Prevents head/feet clipping when align3d's solver picks a camera that zooms in past the canvas edges. Uniform scale-down with re-center; no-op when the pose already fits."}),
+                "fit_margin_px": ("INT", {"default": 12, "min": 0, "max": 128, "step": 1, "tooltip": "Minimum pixel margin between the projected pose AABB and every canvas edge after fitting. Default 12 covers the typical ~10-11 px cylinder radius; widen if heads/hands still touch the edge."}),
             }
     }
 
@@ -392,10 +394,10 @@ class RenderNLFPoses:
     FUNCTION = "predict"
     CATEGORY = "WanVideoWrapper"
 
-    def predict(self, nlf_poses, width, height, dw_poses=None, ref_dw_pose=None, draw_face=True, draw_hands=True, render_device="gpu", scale_hands=True, render_backend="taichi", single_person=False):
+    def predict(self, nlf_poses, width, height, dw_poses=None, ref_dw_pose=None, draw_face=True, draw_hands=True, render_device="gpu", scale_hands=True, render_backend="taichi", single_person=False, fit_in_canvas=True, fit_margin_px=12):
 
         from .NLFPoseExtract.nlf_render import render_nlf_as_images, render_multi_nlf_as_images, shift_dwpose_according_to_nlf, process_data_to_COCO_format, intrinsic_matrix_from_field_of_view
-        from .NLFPoseExtract.align3d import solve_new_camera_params_central, solve_new_camera_params_down
+        from .NLFPoseExtract.align3d import solve_new_camera_params_central, solve_new_camera_params_down, fit_intrinsic_to_canvas
         if render_backend == "taichi":
             try:
                 import taichi as ti
@@ -475,6 +477,12 @@ class RenderNLFPoses:
             scale_face = scale_faces(list(dw_pose_input), list(ref_dw_pose_input))   # poses[0]['faces'].shape: 1, 68, 2  , poses_ref[0]['faces'].shape: 1, 68, 2
 
             logging.info(f"Scale - m: {scale_m}, face: {scale_face}")
+
+            if fit_in_canvas:
+                new_camera_intrinsics = fit_intrinsic_to_canvas(
+                    new_camera_intrinsics, pose_input, height, width, fit_margin_px
+                )
+
             shift_dwpose_according_to_nlf(pose_input, dw_pose_input, ori_camera_pose, new_camera_intrinsics, height, width, swap_hands=swap_hands, scale_hands=scale_hands, scale_x=scale_m, scale_y=scale_m*scale_s)
 
             intrinsic_matrix = new_camera_intrinsics
