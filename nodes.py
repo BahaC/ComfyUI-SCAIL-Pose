@@ -326,32 +326,82 @@ def filter_to_single_person(pose_input, dw_pose_input, intrinsic_matrix, height,
         else:
             filtered_pose_input.append(frame_poses)
 
+    # Maximum normalized 0..1 distance between the NLF main person's
+    # projected head and the closest DWPose person we're willing to accept.
+    # 0.15 (~15% of image dimension) is much larger than typical
+    # head-to-body-center / head-to-nose offsets for the same person, so
+    # this is a "different person" guard rather than a tight match. When
+    # exceeded, DWPose for that frame is dropped entirely so the wrong
+    # person's face/hands don't get drawn onto the NLF skeleton (see the
+    # frame-97 background-person leak case).
+    DW_MATCH_THRESHOLD = 0.15
+
     if dw_pose_input is not None:
         for frame_idx, frame_dw in enumerate(dw_pose_input):
             num_dw_people = frame_dw['bodies']['candidate'].shape[0]
-            if num_dw_people <= 1:
+            if num_dw_people == 0:
                 continue
 
             nlf_frame = filtered_pose_input[frame_idx]
             best_dw_idx = 0
+            min_dist = float('inf')
+            have_nlf_head = False
 
             if nlf_frame.shape[0] > 0:
-                neck = nlf_frame[0][15]
-                neck_np = neck.cpu().numpy() if isinstance(neck, torch.Tensor) else neck
-                if np.sum(np.abs(neck_np)) > 0.01 and neck_np[2] > 0.01:
-                    u = (fx * neck_np[0] / neck_np[2] + cx) / width
-                    v = (fy * neck_np[1] / neck_np[2] + cy) / height
-                    neck_2d = np.array([u, v])
+                head = nlf_frame[0][15]  # NLF joint 15 = head/nose
+                head_np = head.cpu().numpy() if isinstance(head, torch.Tensor) else head
+                if np.sum(np.abs(head_np)) > 0.01 and head_np[2] > 0.01:
+                    u = (fx * head_np[0] / head_np[2] + cx) / width
+                    v = (fy * head_np[1] / head_np[2] + cy) / height
+                    nlf_head_2d = np.array([u, v])
+                    have_nlf_head = True
 
-                    min_dist = float('inf')
                     for dw_p_idx in range(num_dw_people):
                         dw_body = frame_dw['bodies']['candidate'][dw_p_idx]
-                        valid = np.any(dw_body != 0, axis=1)
-                        dw_center = np.mean(dw_body[valid], axis=0) if np.any(valid) else np.mean(dw_body, axis=0)
-                        dist = np.linalg.norm(neck_2d - dw_center)
+                        dw_subset = frame_dw['bodies']['subset'][dw_p_idx]
+                        # Prefer nose-to-nose (DWPose joint 0 in COCO 18) when
+                        # the nose is visible; fall back to body center over
+                        # visible keypoints when not.
+                        if dw_subset[0] != -1.0 and np.any(dw_body[0] != 0):
+                            dw_ref = dw_body[0]
+                        else:
+                            valid = np.any(dw_body != 0, axis=1)
+                            if np.any(valid):
+                                dw_ref = np.mean(dw_body[valid], axis=0)
+                            else:
+                                dw_ref = np.mean(dw_body, axis=0)
+                        dist = float(np.linalg.norm(nlf_head_2d - dw_ref))
                         if dist < min_dist:
                             min_dist = dist
                             best_dw_idx = dw_p_idx
+
+            # Drop this frame's DWPose entirely when even the closest
+            # match is implausibly far from the NLF-tracked head: typically
+            # means YOLO/DWPose only saw a different person (e.g. someone in
+            # the background) at that frame, so keeping their face/hands
+            # would draw the wrong person's head on top of the right person's
+            # body. shift_dwpose_according_to_nlf already handles count
+            # mismatches (NLF: 1, DW: 0) by skipping the per-frame shift, and
+            # draw_pose_to_canvas_np then has no 2D detail to overlay -- the
+            # NLF body cylinders (including Neck->Nose) still render.
+            if have_nlf_head and min_dist > DW_MATCH_THRESHOLD:
+                logging.warning(
+                    "filter_to_single_person: frame %d: best DWPose match is "
+                    "%.3f normalized units from NLF head (>%.2f); dropping "
+                    "DWPose for this frame to prevent wrong-person face/hands.",
+                    frame_idx, min_dist, DW_MATCH_THRESHOLD,
+                )
+                frame_dw['bodies']['candidate'] = frame_dw['bodies']['candidate'][0:0]
+                frame_dw['bodies']['subset'] = frame_dw['bodies']['subset'][0:0]
+                frame_dw['hands'] = frame_dw['hands'][0:0]
+                frame_dw['faces'] = frame_dw['faces'][0:0]
+                if 'body_score' in frame_dw:
+                    frame_dw['body_score'] = frame_dw['body_score'][0:0]
+                if 'hand_score' in frame_dw:
+                    frame_dw['hand_score'] = frame_dw['hand_score'][0:0]
+                if 'face_score' in frame_dw:
+                    frame_dw['face_score'] = frame_dw['face_score'][0:0]
+                continue
 
             p = best_dw_idx
             frame_dw['bodies']['candidate'] = frame_dw['bodies']['candidate'][p:p+1]
@@ -366,6 +416,186 @@ def filter_to_single_person(pose_input, dw_pose_input, intrinsic_matrix, height,
                 frame_dw['face_score'] = frame_dw['face_score'][p:p+1]
 
     return filtered_pose_input, dw_pose_input
+
+
+# NLF SMPL joint indices that feed the COCO arm bones via
+# `process_data_to_COCO_format`: 16/17 = R/L shoulder, 18/19 = R/L elbow,
+# 20/21 = R/L wrist. The cylinder builder in nlf_render skips any bone whose
+# endpoint is all-zero, so when NLF briefly loses one of these joints the whole
+# arm vanishes from the render. The two helpers below patch those gaps before
+# rendering.
+_NLF_ARM_JOINT_INDICES = (16, 17, 18, 19, 20, 21)
+
+
+def _joint_to_np(joint):
+    """Return a numpy view of a single (3,) NLF joint, regardless of source type."""
+    if isinstance(joint, torch.Tensor):
+        return joint.detach().cpu().numpy()
+    return np.asarray(joint)
+
+
+def _set_joint_inplace(pose_frame, joint_idx, xyz):
+    """Write `xyz` (length-3 array-like) into `pose_frame[0][joint_idx]` in place.
+
+    `pose_frame` is `pose_input[frame_idx]` of shape (1, 24, 3). It can be a
+    torch tensor or a numpy array; both support indexed assignment, but tensors
+    need a tensor RHS on the right device/dtype.
+    """
+    if isinstance(pose_frame, torch.Tensor):
+        rhs = torch.as_tensor(xyz, dtype=pose_frame.dtype, device=pose_frame.device)
+        pose_frame[0][joint_idx] = rhs
+    else:
+        pose_frame[0][joint_idx] = np.asarray(xyz, dtype=pose_frame.dtype)
+
+
+def _interpolate_arm_joints_temporal(pose_input):
+    """Linearly interpolate NLF arm joints across frames where NLF dropped them.
+
+    Operates per joint in `_NLF_ARM_JOINT_INDICES`. A joint is considered
+    "missing" when its (X, Y, Z) is all-zero (NLF's convention for a dropped
+    joint, matching the same `np.sum(np.abs(...)) < 0.01` test used elsewhere
+    in this file). For each missing frame the function finds the nearest valid
+    frame before and after; if both exist, it linearly interpolates the 3D
+    coords by frame distance; if only one side exists, that side's value is
+    carried over. Joints that are missing across the entire clip are left for
+    `_backfill_arm_joints_from_dwpose` to handle.
+
+    Assumes `pose_input` is the post-`filter_to_single_person` list where each
+    frame's shape is (1, 24, 3) (single tracked person). Mutates in place.
+    """
+    n_frames = len(pose_input)
+    if n_frames == 0:
+        return
+
+    for joint_idx in _NLF_ARM_JOINT_INDICES:
+        coords = [None] * n_frames
+        for f_idx in range(n_frames):
+            frame = pose_input[f_idx]
+            if frame is None or frame.shape[0] == 0:
+                continue
+            jnp = _joint_to_np(frame[0][joint_idx])
+            if np.sum(np.abs(jnp)) > 0.01:
+                coords[f_idx] = jnp.astype(np.float32, copy=True)
+
+        if not any(c is not None for c in coords):
+            continue
+
+        for f_idx in range(n_frames):
+            if coords[f_idx] is not None:
+                continue
+            frame = pose_input[f_idx]
+            if frame is None or frame.shape[0] == 0:
+                continue
+
+            before_idx = None
+            for i in range(f_idx - 1, -1, -1):
+                if coords[i] is not None:
+                    before_idx = i
+                    break
+            after_idx = None
+            for i in range(f_idx + 1, n_frames):
+                if coords[i] is not None:
+                    after_idx = i
+                    break
+
+            if before_idx is not None and after_idx is not None:
+                span = float(after_idx - before_idx)
+                t = float(f_idx - before_idx) / span
+                interpolated = coords[before_idx] * (1.0 - t) + coords[after_idx] * t
+            elif before_idx is not None:
+                interpolated = coords[before_idx]
+            elif after_idx is not None:
+                interpolated = coords[after_idx]
+            else:
+                continue
+
+            _set_joint_inplace(frame, joint_idx, interpolated)
+
+
+# Mapping from NLF arm joint index to (DWPose COCO-18 candidate index,
+# NLF parent joint index used for the back-projection depth). The parent
+# choice walks the kinematic chain neck -> shoulder -> elbow -> wrist so
+# we read Z from a joint that's almost always closer to the camera than
+# the missing one and is least likely to itself be dropped.
+_NLF_TO_DW_ARM_MAP = {
+    16: (5, 12),  # R shoulder, parent: neck
+    17: (2, 12),  # L shoulder, parent: neck
+    18: (6, 16),  # R elbow,    parent: R shoulder
+    19: (3, 17),  # L elbow,    parent: L shoulder
+    20: (7, 18),  # R wrist,    parent: R elbow
+    21: (4, 19),  # L wrist,    parent: L elbow
+}
+
+
+def _backfill_arm_joints_from_dwpose(pose_input, dw_pose_input, intrinsic_matrix, height, width):
+    """Back-project DWPose 2D arm keypoints to 3D for joints NLF still hasn't filled.
+
+    Runs AFTER `_interpolate_arm_joints_temporal`, so it only ever touches
+    joints that are missing for an entire neighbourhood (no valid frame to
+    interpolate from) but where DWPose still has the corresponding 2D body
+    keypoint. The depth (Z) is borrowed from the parent NLF joint along the
+    kinematic chain, with neck and then pelvis as further fallbacks; the
+    pinhole back-projection then places the joint at the correct 2D position
+    so the cylinder Builder draws the upper-arm / forearm bone normally.
+
+    Skips silently when no DWPose data exists for the frame, when the DWPose
+    keypoint is flagged missing (`subset[dw_idx] == -1.0` or zero coords), or
+    when no usable depth source is available.
+    """
+    if dw_pose_input is None:
+        return
+
+    fx = float(intrinsic_matrix[0, 0])
+    fy = float(intrinsic_matrix[1, 1])
+    cx = float(intrinsic_matrix[0, 2])
+    cy = float(intrinsic_matrix[1, 2])
+
+    n_frames = len(pose_input)
+    for f_idx in range(n_frames):
+        frame = pose_input[f_idx]
+        if frame is None or frame.shape[0] == 0:
+            continue
+        if f_idx >= len(dw_pose_input):
+            break
+        frame_dw = dw_pose_input[f_idx]
+        try:
+            dw_cand = np.asarray(frame_dw['bodies']['candidate'], dtype=np.float32)
+            dw_subset = np.asarray(frame_dw['bodies']['subset'], dtype=np.float32)
+        except (KeyError, TypeError):
+            continue
+        if dw_cand.ndim != 3 or dw_cand.shape[0] == 0:
+            continue
+        dw_body = dw_cand[0]
+        dw_sub = dw_subset[0]
+
+        for nlf_idx, (dw_idx, parent_idx) in _NLF_TO_DW_ARM_MAP.items():
+            jnp = _joint_to_np(frame[0][nlf_idx])
+            if np.sum(np.abs(jnp)) > 0.01:
+                continue
+
+            if dw_idx >= dw_body.shape[0] or dw_idx >= dw_sub.shape[0]:
+                continue
+            if dw_sub[dw_idx] == -1.0:
+                continue
+            u_norm, v_norm = float(dw_body[dw_idx, 0]), float(dw_body[dw_idx, 1])
+            if u_norm == 0.0 and v_norm == 0.0:
+                continue
+
+            Z = 0.0
+            for cand_parent in (parent_idx, 12, 0):
+                parent_np = _joint_to_np(frame[0][cand_parent])
+                if np.sum(np.abs(parent_np)) > 0.01 and parent_np[2] > 0.01:
+                    Z = float(parent_np[2])
+                    break
+            if Z <= 0.0:
+                continue
+
+            u_px = u_norm * float(width)
+            v_px = v_norm * float(height)
+            X = (u_px - cx) * Z / fx
+            Y = (v_px - cy) * Z / fy
+            _set_joint_inplace(frame, nlf_idx, (X, Y, Z))
+
 
 class RenderNLFPoses:
     @classmethod
@@ -427,6 +657,14 @@ class RenderNLFPoses:
 
         if single_person:
             pose_input, dw_pose_input = filter_to_single_person(pose_input, dw_pose_input, ori_camera_pose, height, width)
+            # Patch the runs of frames where NLF drops elbow/wrist joints so
+            # the cylinder builder can still draw the arm bones. Temporal pass
+            # first (nearest-neighbour interpolation of arm joints across
+            # frames), then DWPose 2D back-projection for any joints still
+            # missing afterwards. See _interpolate_arm_joints_temporal and
+            # _backfill_arm_joints_from_dwpose for details.
+            _interpolate_arm_joints_temporal(pose_input)
+            _backfill_arm_joints_from_dwpose(pose_input, dw_pose_input, ori_camera_pose, height, width)
 
         num_people = dw_pose_input[0]['bodies']['candidate'].shape[0] if dw_pose_input is not None else 0
 

@@ -683,6 +683,27 @@ class LisaPoseDuplicateByBBoxes:
                         ),
                     },
                 ),
+                "stabilize_translation": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": (
+                            "Cancel horizontal walk in the driving pose so "
+                            "each clone stays centered at its reference "
+                            "bbox center for the full clip. Per frame the "
+                            "static driving-DWPose crop is shifted by the "
+                            "current foreground-bbox center minus the "
+                            "first-frame center; off-canvas pixels are "
+                            "zero-padded so the crop size (and therefore "
+                            "the rendered clone scale) is unchanged. "
+                            "Vertical motion is left untouched so floor_pin "
+                            "can still handle jumps/crouches. Active only "
+                            "when driving_dw_poses is connected; otherwise "
+                            "the per-frame foreground bbox is already used "
+                            "as the crop and the dancer is already tracked."
+                        ),
+                    },
+                ),
             },
             "optional": {
                 "driving_dw_poses": ("DWPOSES",),
@@ -712,6 +733,7 @@ class LisaPoseDuplicateByBBoxes:
         max_targets: int,
         passthrough_when_single: bool = True,
         same_z_gap: float = 0.0,
+        stabilize_translation: bool = True,
         driving_dw_poses: Optional[Dict[str, Any]] = None,
     ):
         if pose_canvas.ndim != 4:
@@ -832,6 +854,7 @@ class LisaPoseDuplicateByBBoxes:
             bool(floor_pin),
             bool(validate_feet),
             cx_overrides,
+            bool(stabilize_translation),
         )
 
         out_full = out_full.clamp_(0.0, 1.0)
@@ -850,9 +873,27 @@ class LisaPoseDuplicateByBBoxes:
         floor_pin: bool,
         validate_feet: bool,
         cx_overrides: Optional[Dict[int, float]] = None,
+        stabilize_translation: bool = True,
     ) -> torch.Tensor:
         B, H, W, _ = canvas.shape
         out = torch.zeros_like(canvas)
+
+        stabilize_active = bool(stabilize_translation) and drv_static is not None
+        ref_cx_stab: Optional[float] = None
+        crop_w_const: int = 0
+        crop_h_const: int = 0
+        if stabilize_active:
+            dsx0, dsy0, dsx1, dsy1 = drv_static
+            ref_cx_stab = 0.5 * (float(dsx0) + float(dsx1))
+            crop_w_const = int(dsx1 - dsx0)
+            crop_h_const = int(dsy1 - dsy0)
+            if crop_w_const < 2 or crop_h_const < 2:
+                stabilize_active = False
+                ref_cx_stab = None
+
+        dx_min = float("inf")
+        dx_max = float("-inf")
+        dx_n = 0
 
         for f_idx in range(B):
             frame = canvas[f_idx]
@@ -862,19 +903,73 @@ class LisaPoseDuplicateByBBoxes:
             sx0, sy0, sx1, sy1, mask_full = fg_info
             if drv_static is not None:
                 dsx0, dsy0, dsx1, dsy1 = drv_static
-                src_x0 = max(0, min(W - 1, dsx0))
-                src_y0 = max(0, min(H - 1, dsy0))
-                src_x1 = max(src_x0 + 1, min(W, dsx1))
-                src_y1 = max(src_y0 + 1, min(H, dsy1))
+                if stabilize_active and ref_cx_stab is not None:
+                    cur_cx = 0.5 * (float(sx0) + float(sx1))
+                    dx = int(round(cur_cx - ref_cx_stab))
+                    if dx < dx_min:
+                        dx_min = float(dx)
+                    if dx > dx_max:
+                        dx_max = float(dx)
+                    dx_n += 1
+                    raw_x0 = int(dsx0) + dx
+                    raw_y0 = int(dsy0)
+                    raw_x1 = raw_x0 + crop_w_const
+                    raw_y1 = raw_y0 + crop_h_const
+
+                    inner_x0 = max(0, raw_x0)
+                    inner_y0 = max(0, raw_y0)
+                    inner_x1 = min(W, raw_x1)
+                    inner_y1 = min(H, raw_y1)
+                    inner_w = inner_x1 - inner_x0
+                    inner_h = inner_y1 - inner_y0
+                    if inner_w < 2 or inner_h < 2:
+                        continue
+
+                    pad_left = inner_x0 - raw_x0
+                    pad_top = inner_y0 - raw_y0
+
+                    crop_img = torch.zeros(
+                        (crop_h_const, crop_w_const, 3),
+                        dtype=frame.dtype,
+                        device=frame.device,
+                    )
+                    crop_mask = torch.zeros(
+                        (crop_h_const, crop_w_const),
+                        dtype=mask_full.dtype,
+                        device=mask_full.device,
+                    )
+                    crop_img[
+                        pad_top : pad_top + inner_h,
+                        pad_left : pad_left + inner_w,
+                        :,
+                    ] = frame[inner_y0:inner_y1, inner_x0:inner_x1, :3]
+                    crop_mask[
+                        pad_top : pad_top + inner_h,
+                        pad_left : pad_left + inner_w,
+                    ] = mask_full[inner_y0:inner_y1, inner_x0:inner_x1]
+                    crop_h = crop_h_const
+                    crop_w = crop_w_const
+                    if not bool(crop_mask.any()):
+                        continue
+                else:
+                    src_x0 = max(0, min(W - 1, dsx0))
+                    src_y0 = max(0, min(H - 1, dsy0))
+                    src_x1 = max(src_x0 + 1, min(W, dsx1))
+                    src_y1 = max(src_y0 + 1, min(H, dsy1))
+                    crop_img = frame[src_y0:src_y1, src_x0:src_x1, :3]
+                    crop_mask = mask_full[src_y0:src_y1, src_x0:src_x1]
+                    crop_h = src_y1 - src_y0
+                    crop_w = src_x1 - src_x0
+                    if crop_h < 2 or crop_w < 2 or not bool(crop_mask.any()):
+                        continue
             else:
                 src_x0, src_y0, src_x1, src_y1 = sx0, sy0, sx1, sy1
-
-            crop_img = frame[src_y0:src_y1, src_x0:src_x1, :3]
-            crop_mask = mask_full[src_y0:src_y1, src_x0:src_x1]
-            crop_h = src_y1 - src_y0
-            crop_w = src_x1 - src_x0
-            if crop_h < 2 or crop_w < 2 or not bool(crop_mask.any()):
-                continue
+                crop_img = frame[src_y0:src_y1, src_x0:src_x1, :3]
+                crop_mask = mask_full[src_y0:src_y1, src_x0:src_x1]
+                crop_h = src_y1 - src_y0
+                crop_w = src_x1 - src_x0
+                if crop_h < 2 or crop_w < 2 or not bool(crop_mask.any()):
+                    continue
 
             for k_idx, box in enumerate(scaled_bboxes):
                 tx0, ty0, tx1, ty1 = box
@@ -943,15 +1038,401 @@ class LisaPoseDuplicateByBBoxes:
                     target_slice, place_img
                 )
 
+        if stabilize_active and ref_cx_stab is not None and dx_n > 0:
+            logging.info(
+                "LisaPoseDuplicateByBBoxes: stabilize_translation engaged "
+                "(ref_cx=%.1f, dx range over %d frames = [%+.1f, %+.1f] px).",
+                ref_cx_stab,
+                dx_n,
+                dx_min,
+                dx_max,
+            )
+        elif bool(stabilize_translation) and drv_static is None:
+            logging.info(
+                "LisaPoseDuplicateByBBoxes: stabilize_translation requested "
+                "but driving_dw_poses is not connected; per-frame foreground "
+                "bbox is already used, dancer is already tracked (no-op)."
+            )
+
         return out
+
+
+def _person_height_normalized(
+    candidate: np.ndarray,
+    subset: np.ndarray,
+    min_visible: int,
+) -> Optional[float]:
+    """Return the normalized 0..1 bbox height for a single person, or None."""
+    normed = _bbox_from_candidate(candidate, subset, min_visible)
+    if normed is None:
+        return None
+    _, y0n, _, y1n = normed
+    h = float(y1n) - float(y0n)
+    if h <= 0.0:
+        return None
+    return h
+
+
+def _slice_frame_persons(
+    frame: Dict[str, Any],
+    kept_idxs: List[int],
+) -> Dict[str, Any]:
+    """Return a shallow-copied frame dict with per-person fields sliced.
+
+    ``bodies.candidate``, ``bodies.subset``, ``faces``, ``body_score``,
+    ``face_score`` are sliced along axis 0 by ``kept_idxs`` (one entry
+    per person). ``hands`` and ``hand_score`` are sliced by
+    ``[2*i, 2*i+1 for i in kept_idxs]`` because the upstream
+    ``merge_dwpose_results`` packs two hands per person along axis 0;
+    this matches the ``[2*p:2*p+2]`` convention used in
+    ``nodes.py::filter_to_single_person``. Optional keys missing on a
+    given frame are tolerated (the OpenPose-converted DWPose path can
+    omit ``*_score`` fields).
+    """
+    new_frame: Dict[str, Any] = dict(frame)
+
+    bodies = frame.get("bodies")
+    if isinstance(bodies, dict):
+        new_bodies: Dict[str, Any] = dict(bodies)
+        cand = bodies.get("candidate")
+        if cand is not None:
+            cand_arr = np.asarray(cand)
+            if cand_arr.ndim >= 1 and cand_arr.shape[0] > 0:
+                new_bodies["candidate"] = cand_arr[kept_idxs] if kept_idxs else cand_arr[0:0]
+            else:
+                new_bodies["candidate"] = cand_arr
+        sub = bodies.get("subset")
+        if sub is not None:
+            sub_arr = np.asarray(sub)
+            if sub_arr.ndim >= 1 and sub_arr.shape[0] > 0:
+                new_bodies["subset"] = sub_arr[kept_idxs] if kept_idxs else sub_arr[0:0]
+            else:
+                new_bodies["subset"] = sub_arr
+        new_frame["bodies"] = new_bodies
+
+    hand_idxs = [j for i in kept_idxs for j in (2 * i, 2 * i + 1)]
+    for key in ("faces", "body_score", "face_score"):
+        val = frame.get(key)
+        if val is None:
+            continue
+        val_arr = np.asarray(val)
+        if val_arr.ndim >= 1 and val_arr.shape[0] > 0:
+            new_frame[key] = val_arr[kept_idxs] if kept_idxs else val_arr[0:0]
+        else:
+            new_frame[key] = val_arr
+    for key in ("hands", "hand_score"):
+        val = frame.get(key)
+        if val is None:
+            continue
+        val_arr = np.asarray(val)
+        if val_arr.ndim >= 1 and val_arr.shape[0] > 0:
+            new_frame[key] = val_arr[hand_idxs] if hand_idxs else val_arr[0:0]
+        else:
+            new_frame[key] = val_arr
+
+    return new_frame
+
+
+_PERSISTENT_FRACTION = 0.5
+
+
+def _per_frame_person_counts(poses: List[Any]) -> List[int]:
+    """Return a list with the post-filter person count for each frame."""
+    counts: List[int] = []
+    for frame in poses:
+        if not isinstance(frame, dict):
+            counts.append(0)
+            continue
+        bodies = frame.get("bodies")
+        if not isinstance(bodies, dict):
+            counts.append(0)
+            continue
+        cand = bodies.get("candidate")
+        if cand is None:
+            counts.append(0)
+            continue
+        try:
+            arr = np.asarray(cand)
+        except (TypeError, ValueError):
+            counts.append(0)
+            continue
+        if arr.ndim < 1:
+            counts.append(0)
+            continue
+        counts.append(int(arr.shape[0]))
+    return counts
+
+
+def _count_persistent_persons(
+    poses: List[Any],
+    frac_threshold: float = _PERSISTENT_FRACTION,
+) -> int:
+    """Return the largest k for which more than ``frac_threshold`` of frames
+    have at least k persons.
+
+    Interpretation of "person is in most of the frames": a k-th person is
+    counted if strictly more than ``frac_threshold`` (default 0.5, i.e.
+    a simple majority) of the frames contain at least k persons. The
+    output is the largest such k, so the count reflects the typical
+    population of the video rather than transient ghost detections.
+
+    Returns 0 for an empty pose list or when every frame has zero
+    persons.
+    """
+    counts = _per_frame_person_counts(poses)
+    n = len(counts)
+    if n == 0:
+        return 0
+    max_k = max(counts) if counts else 0
+    if max_k <= 0:
+        return 0
+    threshold_count = float(frac_threshold) * float(n)
+    result = 0
+    for k in range(1, int(max_k) + 1):
+        n_meet = sum(1 for c in counts if c >= k)
+        if float(n_meet) > threshold_count:
+            result = k
+        else:
+            break
+    return result
+
+
+class LisaRefVideoFilter:
+    """Drop secondary persons from a DWPOSES payload by relative height.
+
+    Behaviour:
+
+    - If the first valid frame of the input ``dw_poses`` has 0 or 1
+      detected person, the input is returned unchanged (true
+      passthrough — downstream nodes see byte-identical data).
+    - Otherwise, the largest person in the first frame (max bbox
+      height) is treated as the **primary**. For every frame, any
+      person whose bbox height is below
+      ``(1 - threshold) * primary_h_first_frame`` is removed from
+      that frame.
+    - The threshold is the maximum allowed *relative shrinkage* of a
+      secondary person's bbox height compared to the first-frame
+      primary, i.e. drop when
+      ``(primary_h - other_h) / primary_h > threshold``. With
+      ``threshold = 0.4`` only poses at >= 60% of the first-frame
+      primary height survive.
+
+    Because the reference is the first-frame primary height (not the
+    per-frame primary), the primary itself can be dropped in later
+    frames if it shrinks enough — the node logs a warning whenever a
+    frame loses all of its persons so you can re-tune the threshold.
+
+    Heights are taken from the normalized DWPose candidate (0..1 in
+    canvas coords), so the threshold is canvas-resolution
+    independent.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "dw_poses": ("DWPOSES",),
+                "threshold": (
+                    "FLOAT",
+                    {
+                        "default": 0.4,
+                        "min": 0.0,
+                        "max": 1.0,
+                        "step": 0.01,
+                        "tooltip": (
+                            "Maximum allowed relative shrinkage of a "
+                            "secondary pose's bbox height compared to "
+                            "the first-frame primary pose's bbox "
+                            "height. Drop a pose when "
+                            "(primary_h - other_h) / primary_h > "
+                            "threshold. e.g. 0.4 keeps poses with "
+                            "bbox height >= 60% of the first-frame "
+                            "primary. 0.0 drops every non-primary "
+                            "pose; 1.0 keeps everything."
+                        ),
+                    },
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("DWPOSES", "INT")
+    RETURN_NAMES = ("dw_poses", "num_people")
+    FUNCTION = "process"
+    CATEGORY = "WanVideoWrapper/Lisa"
+    DESCRIPTION = (
+        "Filter a DWPOSES payload by per-person bbox height. "
+        "Single-person first frames pass through unchanged; "
+        "otherwise non-primary persons whose bbox height shrinks "
+        "by more than `threshold` (relative to the first-frame "
+        "primary) are removed from every frame. Also emits "
+        "num_people: the largest k for which strictly more than "
+        "half of the returned frames contain at least k persons."
+    )
+
+    _MIN_VISIBLE = 6
+
+    def process(self, dw_poses: Dict[str, Any], threshold: float):
+        if not isinstance(dw_poses, dict):
+            raise ValueError("dw_poses must be a DWPOSES dict.")
+        poses = dw_poses.get("poses")
+        if not isinstance(poses, list) or len(poses) == 0:
+            return self._finalize(dw_poses, "empty-or-missing poses list")
+
+        thr = float(max(0.0, min(1.0, threshold)))
+
+        first_idx = None
+        first_cand: Optional[np.ndarray] = None
+        first_sub: Optional[np.ndarray] = None
+        for f_idx, frame in enumerate(poses):
+            try:
+                cand = np.asarray(frame["bodies"]["candidate"], dtype=np.float32)
+                sub = np.asarray(frame["bodies"]["subset"], dtype=np.float32)
+            except (KeyError, TypeError):
+                continue
+            if cand.ndim != 3 or cand.shape[0] == 0:
+                continue
+            first_idx = f_idx
+            first_cand = cand
+            first_sub = sub
+            break
+
+        if first_cand is None or first_cand.shape[0] <= 1:
+            logging.info(
+                "LisaRefVideoFilter: first valid frame has %d detected "
+                "person(s); passthrough (threshold=%.2f).",
+                0 if first_cand is None else int(first_cand.shape[0]),
+                thr,
+            )
+            return self._finalize(dw_poses, "single-person passthrough")
+
+        first_heights: List[Optional[float]] = []
+        for p_idx in range(first_cand.shape[0]):
+            sub_p = first_sub[p_idx] if first_sub is not None and p_idx < first_sub.shape[0] else None
+            first_heights.append(
+                _person_height_normalized(first_cand[p_idx], sub_p, self._MIN_VISIBLE)
+            )
+        valid_first = [h for h in first_heights if h is not None]
+        if len(valid_first) <= 1:
+            logging.info(
+                "LisaRefVideoFilter: first valid frame has %d person(s) "
+                "but only %d with usable bbox; passthrough "
+                "(threshold=%.2f).",
+                int(first_cand.shape[0]),
+                len(valid_first),
+                thr,
+            )
+            return self._finalize(dw_poses, "no-valid-bbox passthrough")
+
+        primary_h = max(valid_first)
+        keep_h_min = (1.0 - thr) * primary_h
+
+        new_poses: List[Dict[str, Any]] = []
+        total_in = 0
+        total_kept = 0
+        empty_frames = 0
+        for f_idx, frame in enumerate(poses):
+            if not isinstance(frame, dict):
+                new_poses.append(frame)
+                continue
+            bodies = frame.get("bodies")
+            if not isinstance(bodies, dict):
+                new_poses.append(frame)
+                continue
+            try:
+                cand = np.asarray(bodies["candidate"], dtype=np.float32)
+                sub = np.asarray(bodies["subset"], dtype=np.float32)
+            except (KeyError, TypeError):
+                new_poses.append(frame)
+                continue
+            if cand.ndim != 3 or cand.shape[0] == 0:
+                new_poses.append(frame)
+                continue
+
+            n_persons = int(cand.shape[0])
+            total_in += n_persons
+            kept_idxs: List[int] = []
+            for p_idx in range(n_persons):
+                sub_p = sub[p_idx] if sub.ndim >= 2 and p_idx < sub.shape[0] else None
+                h = _person_height_normalized(cand[p_idx], sub_p, self._MIN_VISIBLE)
+                if h is None:
+                    continue
+                if h >= keep_h_min:
+                    kept_idxs.append(p_idx)
+            total_kept += len(kept_idxs)
+
+            if len(kept_idxs) == n_persons:
+                new_poses.append(frame)
+                continue
+
+            if not kept_idxs:
+                empty_frames += 1
+                logging.warning(
+                    "LisaRefVideoFilter: frame %d lost all %d persons "
+                    "(primary_h=%.4f, keep_h_min=%.4f, threshold=%.2f).",
+                    f_idx,
+                    n_persons,
+                    primary_h,
+                    keep_h_min,
+                    thr,
+                )
+
+            new_poses.append(_slice_frame_persons(frame, kept_idxs))
+
+        out_dict: Dict[str, Any] = dict(dw_poses)
+        out_dict["poses"] = new_poses
+
+        logging.info(
+            "LisaRefVideoFilter: filtered %d frames "
+            "(first_frame=%d, primary_h=%.4f, threshold=%.2f, "
+            "keep_h_min=%.4f); kept %d/%d persons across all frames"
+            "%s.",
+            len(poses),
+            int(first_idx) if first_idx is not None else -1,
+            primary_h,
+            thr,
+            keep_h_min,
+            total_kept,
+            total_in,
+            f"; {empty_frames} frame(s) ended empty" if empty_frames else "",
+        )
+
+        return self._finalize(out_dict, "filtered")
+
+    def _finalize(
+        self, out_dwp: Dict[str, Any], reason: str
+    ) -> Tuple[Dict[str, Any], int]:
+        """Compute num_people from the returned DWPOSES and pack the tuple.
+
+        ``num_people`` is the largest k for which strictly more than
+        ``_PERSISTENT_FRACTION`` of the returned frames contain at
+        least k persons (see ``_count_persistent_persons``). The count
+        is taken from the *output* of this node, so passthrough cases
+        and filtered cases both report the population of the data the
+        downstream nodes will actually see.
+        """
+        poses_out = out_dwp.get("poses") if isinstance(out_dwp, dict) else None
+        if not isinstance(poses_out, list):
+            poses_out = []
+        num_people = _count_persistent_persons(poses_out, _PERSISTENT_FRACTION)
+        logging.info(
+            "LisaRefVideoFilter: num_people=%d over %d frame(s) "
+            "(>%.0f%% majority rule, %s).",
+            num_people,
+            len(poses_out),
+            100.0 * _PERSISTENT_FRACTION,
+            reason,
+        )
+        return (out_dwp, int(num_people))
 
 
 NODE_CLASS_MAPPINGS = {
     "LisaBBoxesFromDWPose": LisaBBoxesFromDWPose,
     "LisaPoseDuplicateByBBoxes": LisaPoseDuplicateByBBoxes,
+    "LisaRefVideoFilter": LisaRefVideoFilter,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "LisaBBoxesFromDWPose": "Lisa BBoxes From DWPose",
     "LisaPoseDuplicateByBBoxes": "Lisa Pose Duplicate By BBoxes",
+    "LisaRefVideoFilter": "Ref Video Filter",
 }
