@@ -281,6 +281,35 @@ def _frame_foreground_bbox(
     return sx0, sy0, sx1, sy1, fg
 
 
+def _clip_foreground_union_bbox(
+    canvas: torch.Tensor,
+) -> Optional[Tuple[int, int, int, int]]:
+    """Return the union AABB of foreground pixels across every frame.
+
+    Mirrors ``_frame_foreground_bbox`` but reduced over the batch axis so
+    callers can size a constant crop window that covers every frame's
+    pose extent (head/feet/hand cylinders included, not just the DWPose
+    body keypoint bbox).
+    """
+    if canvas.ndim != 4 or canvas.shape[0] == 0:
+        return None
+    fg = canvas.amax(dim=-1) > _FOREGROUND_EPSILON
+    fg_any = fg.any(dim=0)
+    if not bool(fg_any.any()):
+        return None
+    rows = fg_any.any(dim=1)
+    cols = fg_any.any(dim=0)
+    ys = torch.nonzero(rows, as_tuple=False).flatten()
+    xs = torch.nonzero(cols, as_tuple=False).flatten()
+    sy0 = int(ys.min().item())
+    sy1 = int(ys.max().item()) + 1
+    sx0 = int(xs.min().item())
+    sx1 = int(xs.max().item()) + 1
+    if sx1 <= sx0 + 1 or sy1 <= sy0 + 1:
+        return None
+    return sx0, sy0, sx1, sy1
+
+
 def _drv_bbox_from_dwpose(
     driving_dw_poses: Optional[Dict[str, Any]],
     canvas_w: int,
@@ -841,6 +870,27 @@ class LisaPoseDuplicateByBBoxes:
             )
 
         drv_static = _drv_bbox_from_dwpose(driving_dw_poses, W, H, min_visible=6)
+        if drv_static is not None:
+            fg_union = _clip_foreground_union_bbox(canvas)
+            if fg_union is not None:
+                dsx0, dsy0, dsx1, dsy1 = drv_static
+                ux0, uy0, ux1, uy1 = fg_union
+                expanded = (
+                    min(int(dsx0), int(ux0)),
+                    min(int(dsy0), int(uy0)),
+                    max(int(dsx1), int(ux1)),
+                    max(int(dsy1), int(uy1)),
+                )
+                if expanded != tuple(int(v) for v in drv_static):
+                    logging.info(
+                        "LisaPoseDuplicateByBBoxes: expanded crop bbox from "
+                        "DWPose body %s to %s (union with rendered foreground "
+                        "%s) so head/feet/hand cylinders are not clipped.",
+                        tuple(int(v) for v in drv_static),
+                        expanded,
+                        fg_union,
+                    )
+                drv_static = expanded
 
         out_full = self._composite_all_frames(
             canvas,
